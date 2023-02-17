@@ -1,0 +1,437 @@
+#! /usr/bin/env python3
+
+import glob
+import os
+from argparse import ArgumentParser
+import sys
+
+from bvzdisplaylib import displaylib as displaylib
+
+from src.collisions import Collisions
+from src.image import Image
+from src.notify import Notify
+
+from src import verifiedcopy
+
+
+from src.parserimportphotos import Parser
+from bvzcomparedirs.queryfiles import QueryFiles
+from bvzcomparedirs.canonicalfiles import CanonicalFiles
+from bvzcomparedirs.comparesession import Session
+
+# # ----------------------------------------------------------------------------------------------------------------------
+# def get_images_from_dir(dir_path,
+#                         extensions=None,
+#                         recursive=False,
+#                         dirs_to_ignore=None):
+#     """
+#     Given a directory and a list of legal file name extensions, return a list of all of the files in that directory.
+#     If recursive is set to be True, then descend into all sub-directories as well.
+#
+#     :param dir_path: The path to the directory we are scanning.
+#     :param extensions: A list of file name extensions to process. If left blank, a default set will be used.
+#     :param recursive: If true, then any sub-directories will also be processed. Defaults to False.
+#     :param dirs_to_ignore: A list of directories to ignore if recursive is True. If blank, defaults to an empty list.
+#
+#     :return: A list of file names (complete with path).
+#     """
+#
+#     assert os.path.exists(dir_path)
+#     assert os.path.isdir(dir_path)
+#
+#     files = list()
+#
+#     if extensions is None:
+#         extensions = ["cr2",
+#                       "jpg"]
+#
+#     if dirs_to_ignore is None:
+#         dirs_to_ignore = list()
+#
+#     directory_entries = os.listdir(dir_path)
+#     for entry in directory_entries:
+#         entry = os.path.join(dir_path, entry)
+#         if os.path.isdir(entry):
+#             if recursive and os.path.split(entry)[1] not in dirs_to_ignore:
+#                 files.extend(get_images_from_dir(entry, extensions, recursive, dirs_to_ignore))
+#         else:
+#             if os.path.splitext(entry)[1].lstrip(".").lower() in extensions:
+#                 files.append(entry)
+#
+#     return files
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+def build_image_objects(image_paths,
+                        catalog_path,
+                        do_rename,
+                        notify_obj,
+                        include_sidecars=True,
+                        sidecar_extensions=None):
+    """
+    Given a list of image paths, create a list of image objects. As a part of this, process the exif data for each obj.
+
+    :param image_paths: The list of image paths.
+    :param catalog_path: The path to the image catalog.
+    :param do_rename: Whether to rename the files as they are imported, or just leave the name as is.
+    :param notify_obj: A notification object.
+    :param include_sidecars: If True, then sidecar files will also be included if they exist.
+    :param sidecar_extensions: A list of sidecar extensions to use. Defaults to "xmp".
+
+    :return: A list of image objects.
+    """
+
+    image_objects = list()
+
+    if sidecar_extensions is None:
+        sidecar_extensions = ["xmp"]
+    else:
+        for i in range(len(sidecar_extensions)):
+            sidecar_extensions[i] = sidecar_extensions[i].lstrip(".")
+
+    total_image_count = len(image_paths)
+    curr_image_num = 1
+    for image_path in image_paths:
+        count_str = "(" + str(curr_image_num) + " of " + str(total_image_count) + ")"
+        image_obj = Image(image_path,
+                          catalog_path,
+                          do_rename,
+                          notify_obj,
+                          count_str,
+                          include_sidecars,
+                          sidecar_extensions)
+        image_objects.append(image_obj)
+        curr_image_num += 1
+
+    return image_objects
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+def build_destination_map(image_objects,
+                          notify_obj):
+    """
+    Given a list of image objects, build a dictionary where the key is the destination path of the image, and the value
+    is the image object. Subject to the following tests:
+
+    - If more than one image file in the list of files being imported would resolve to the same destination, determine
+      whether that image file is identical to the previous one, or whether its contents are different.
+
+    - If more than one sidecar file in the list of files being imported would resolve to the same destination, determine
+      whether that sidecar file is identical to the previous one, or whether its contents are different.
+
+    - If an image object's image file would resolve to a file that already exists in the catalog, determine whether the
+      two files are identical, or whether the contents are different.
+
+    - If an image object's sidecar file would resolve to a file that already exists in the catalog, determine whether
+      the two files are identical, or whether the contents are different.
+
+    Returns a tuple consisting of the dest_dict and a collision object that holds lists of possible file collisions.
+
+    :param image_objects: A list of image objects.
+    :param notify_obj: The notification object.
+
+    :return: a tuple consisting of the dest_dict and a collision object that holds lists of possible file collisions.
+    """
+
+    dest_dict = dict()
+    sidecar_dest_dict = dict()
+
+    collisions_obj = Collisions()
+
+    total_num_objects = len(image_objects)
+    curr_obj_num = 1
+
+    for image_object in image_objects:
+
+        collision = False
+
+        msg = "(" + str(curr_obj_num) + " of " + str(total_num_objects) + ")"
+        msg += " Checking: " + image_object.source_path + " to see if it has a possible collision with existing files."
+        notify_obj.notify(msg)
+
+        # Check to see if there would be a collision between source files.
+        if image_object.dest_path in dest_dict.keys():
+            if verifiedcopy.files_are_identical(image_object.source_path,
+                                                dest_dict[image_object.dest_path].source_path):
+                collisions_obj.source_image_collision_identical.append(image_object.source_path)
+                collision = True
+            else:
+                collisions_obj.source_image_collision_different.append(image_object.source_path)
+                collision = True
+
+        # Check to see if there would be a collision between source sidecar files.
+        if image_object.sidecar_dest_path in sidecar_dest_dict.keys():
+            if verifiedcopy.files_are_identical(image_object.sidecar_path,
+                                                dest_dict[image_object.sidecar_dest_path].sidecar_path):
+                collisions_obj.source_sidecar_collision_identical.append(image_object.sidecar_path)
+                collision = True
+            else:
+                collisions_obj.source_sidecar_collision_different.append(image_object.sidecar_path)
+                collision = True
+
+        # Check to see if the destination file already exists.
+        if os.path.exists(image_object.dest_path):
+            if verifiedcopy.files_are_identical(image_object.source_path, image_object.dest_path):
+                collisions_obj.destination_image_exists_identical.append(image_object.source_path)
+                collision = True
+            else:
+                collisions_obj.destination_image_exists_different.append(image_object.source_path)
+                collision = True
+
+        # Check to see if the destination sidecar file already exists.
+        if image_object.sidecar_dest_path and os.path.exists(image_object.sidecar_dest_path):
+            if verifiedcopy.files_are_identical(image_object.sidecar_path, image_object.sidecar_dest_path):
+                collisions_obj.destination_sidecar_exists_identical.append(image_object.sidecar_path)
+                collision = True
+            else:
+                collisions_obj.destination_sidecar_exists_different.append(image_object.sidecar_path)
+                collision = True
+
+        # Add the image object to the dictionary, keyed on the destination path
+        if not collision:
+            dest_dict[image_object.dest_path] = image_object
+
+        curr_obj_num += 1
+
+    return dest_dict, collisions_obj
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+def display_error(msg,
+                  items):
+    """
+    Displays the message give by msg, and the list of items given by items.
+
+    :param msg: The message to display.
+    :param items: A list of items to display.
+
+    :return: Nothing
+    """
+
+    print("\n" * 3)
+    print("-" * 80)
+    print(msg + "\n")
+    for item in items:
+        print("  ", item)
+    print("\nCanceling operation.")
+    print("-" * 80)
+    print("\n" * 3)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+def display_warning(msg,
+                    coda,
+                    items):
+    """
+    Displays the message give by msg, and the list of items given by items. Then asks whether to continue or not.
+
+    :param msg: The message to display.
+    :param coda: A message to display after the list.
+    :param items: A list of items to display.
+
+    :return: True if they user chose to continue, False otherwise.
+    """
+
+    print("\n" * 3)
+    print("-" * 80)
+    print(msg + "\n")
+    for item in items:
+        print("  ", item)
+    print("\n" + coda)
+    print("-" * 80)
+    print("\n" * 3)
+
+    result = ""
+    while result.upper() not in ["Y", "N"]:
+        result = input("Do you want to continue? (Y/N)")
+        if result.upper() == "N":
+            return False
+
+    return True
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+def manage_collisions(collision_obj):
+    """
+    Given a collision object, displays and manages any collisions (by either showing an error on real collisions, or
+    asking the user what to do when there are "soft" collisions (i.e. two files that are identical).
+
+    :param collision_obj:
+    :return:
+    """
+
+    error = False
+
+    if collision_obj.source_image_collision_different:
+        msg = "The following files in the list of files you are importing would collide at the destination:"
+        display_error(msg, collision_obj.source_image_collision_different)
+        error = True
+
+    if collision_obj.destination_image_exists_different:
+        msg = "The following files would overwrite files in the catalog, but they are not identical to those files:"
+        display_error(msg, collision_obj.destination_image_exists_different)
+        error = True
+
+    if collision_obj.source_sidecar_collision_different:
+        msg = "The following sidecar files in the list of files you are importing would collide at the destination:"
+        display_error(msg, collision_obj.source_sidecar_collision_different)
+        error = True
+
+    if collision_obj.destination_sidecar_exists_different:
+        msg = "The following sidecar files would overwrite files in the catalog, but they are not identical to those "
+        msg += "files:"
+        display_error(msg, collision_obj.destination_sidecar_exists_different)
+        error = True
+
+    if error:
+        return False
+
+    if collision_obj.source_image_collision_identical:
+        msg = "The following files in the list of files you are importing are identical to other files you are"
+        msg += " importing:"
+        coda = "These images will be skipped."
+        if not display_warning(msg, coda, collision_obj.source_image_collision_identical):
+            return False
+
+    if collision_obj.destination_image_exists_identical:
+        msg = "The following files in the list of files you are importing are identical to existing files in your "
+        msg += " catalog:"
+        coda = "These images will be skipped."
+        if not display_warning(msg, coda, collision_obj.destination_image_exists_identical):
+            return False
+
+    if collision_obj.source_sidecar_collision_identical:
+        msg = "The following sidecar files in the list of files you are importing are identical to other sidecar files "
+        msg += "you are importing:"
+        coda = "These images will be skipped."
+        if not display_warning(msg, coda, collision_obj.source_sidecar_collision_identical):
+            return False
+
+    if collision_obj.destination_sidecar_exists_identical:
+        msg = "The following sidecar files in the list of files you are importing are identical to existing sidecar "
+        msg += "files in your catalog:"
+        coda = "These images will be skipped."
+        if not display_warning(msg, coda, collision_obj.destination_sidecar_exists_identical):
+            return False
+
+    return True
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+def scan_import_files(items):
+    """
+    Given the list of files and/or directories to import, extract the actual files that are to be processed.
+
+    :param items: The list of files and/or directories to import.
+
+    :return: A queryfiles object.
+    """
+
+    missing = set()
+    islink = set()
+
+    queryfiles_obj = QueryFiles()
+
+    for item in items:
+
+        if not os.path.exists(item):
+            missing.add(item)
+            continue
+
+        if os.path.islink(item):
+            islink.add(item)
+            continue
+
+        if os.path.isdir(item):
+            for counter in queryfiles_obj.scan_directory(item,
+                                                         skip_sub_dir=False,
+                                                         skip_hidden=False,
+                                                         skip_zero_len=True,
+                                                         incl_dir_regexes=None,
+                                                         excl_dir_regexes=None,
+                                                         incl_file_regexes=None,
+                                                         excl_file_regexes=None,
+                                                         report_frequency=10):
+                pass
+            continue
+
+        for counter in queryfiles_obj.scan_files(files_p=[item],
+                                                 skip_hidden=False,
+                                                 skip_zero_len=True,
+                                                 incl_dir_regexes=None,
+                                                 excl_dir_regexes=None,
+                                                 incl_file_regexes=None,
+                                                 excl_file_regexes=None,
+                                                 report_frequency=10):
+            pass
+
+    return queryfiles_obj
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+def scan_catalog_files(catalog_d):
+    """
+    Given the catalog directory, scan its contents.
+
+    :param catalog_d: The path to the catalog directory.
+
+    :return: A canonicalfiles object.
+    """
+
+    canonicalfiles_obj = CanonicalFiles()
+    canonicalfiles_obj.scan_directory(catalog_d)
+
+    return canonicalfiles_obj
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+def main():
+
+    parser_obj = Parser(sys.argv[1:])
+    try:
+        parser_obj.validate()
+    except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
+        msg = f"{{RED}}Error:{{COLOR_NONE}} {e}"
+        displaylib.display_message(msg)
+        sys.exit(1)
+
+    importfiles_obj = scan_import_files(parser_obj.args.import_files)
+    catalogfiles_obj = scan_catalog_files(parser_obj.args.catalog)
+
+    compare_session = Session()
+    sys.exit(0)
+
+
+
+    # # Create a notification object
+    # notify_obj = Notify("stdout", not args.silent)
+    #
+    # notify_obj.notify("-"*80)
+    # notify_obj.notify("Pre-processing images...")
+    image_paths = scan_import_files(args)
+    image_objects = build_image_objects(image_paths,
+                                        args.catalog,
+                                        not args.no_rename,
+                                        notify_obj,
+                                        not args.skip_sidecars,
+                                        args.sidecar_types)
+    dest_dict, collision_obj = build_destination_map(image_objects, notify_obj)
+
+    if not manage_collisions(collision_obj):
+        return
+
+    if len(dest_dict.keys()) == 0:
+        print("No files to copy.")
+        return
+
+    num_files = len(dest_dict.keys())
+    i = 1
+    for key in dest_dict.keys():
+        print(i, "of", num_files)
+        dest_dict[key].copy_to_dest(trial=args.trial_run)
+        i += 1
+
+
+if __name__ == "__main__":
+
+    main()
